@@ -1,15 +1,16 @@
 """
 说明：
-1. 先通过账号/密码登录（会弹出验证码图片窗口，需要你输入验证码）。
+1. 通过账号/密码登录，使用 ddddocr 自动识别算术验证码（2+3+9=? → 识别并计算结果）。
 2. 登录成功后程序自动获取 token 与 batchId（若有多个，默认取第一个），并将其写入运行时配置。
-3. 然后开始异步选课流程（双队列：主队列 + 重试队列）。
-注意：请确保 Python 环境已安装 requests、aiohttp、cryptography、Pillow 等依赖。
+3. 开始异步选课流程（双队列：主队列 + 重试队列）。
+注意：请确保 Python 环境已安装 ddddocr、requests、aiohttp、cryptography、Pillow 等依赖。
 """
 
 import asyncio
 import aiohttp
 import time
 import heapq
+import re
 from typing import List, Dict
 import logging
 from datetime import datetime, timedelta
@@ -21,13 +22,13 @@ import random
 import requests
 import base64
 import json
-import tkinter as tk
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
-from io import BytesIO
-from PIL import Image, ImageTk
 import urllib.parse
+
+# ===== 新增：ddddocr 自动验证码识别 =====
+import ddddocr
 
 global_username = ""
 global_password = ""
@@ -44,7 +45,7 @@ CONFIG = {
     # 二、目标课程配置（示例，可修改）
     # =======================
     "TARGET_COURSES": [
-        {"course_name": "", "teacher": ""},
+        {"course_name": "通信原理(跨学科选课)", "teacher": "江彬"},
     ],
 
     # =======================
@@ -625,7 +626,7 @@ class AsyncCourseSelector:
             logger.info("=" * 60)
 
     async def run(self):
-        logger.info("🎓 东南大学选课助手 (双队列调度版)")
+        logger.info("🎓 东南大学选课助手 (双队列调度版 + 自动算术验证码识别)")
         logger.info("=" * 60)
 
         current_time = self.get_current_time()
@@ -665,7 +666,7 @@ class AsyncCourseSelector:
 
 
 # =========================
-# 同步登录模块（原 SEULogin 类，略作小修改以便在合并文件中使用）
+# 同步登录模块（使用 ddddocr + 专用模型识别算术验证码）
 # =========================
 class SEULogin:
     def __init__(self):
@@ -701,6 +702,20 @@ class SEULogin:
         self.uuid = None
         self.token = None
         self.batch_ids = []
+
+        # ===== 修改：使用同目录下的专用模型文件 =====
+        try:
+            # 使用同目录下的 model.onnx 和 charsets.json
+            self.ocr = ddddocr.DdddOcr(
+                import_onnx_path="model.onnx",      # 同目录下的模型文件
+                charsets_path="charsets.json",      # 同目录下的字符集文件
+                show_ad=False
+            )
+            logger.info("✅ DdddOcr 专用模型加载成功（算术验证码识别）")
+        except Exception as e:
+            logger.error(f"❌ DdddOcr 模型加载失败: {e}")
+            logger.error("请确保 model.onnx 和 charsets.json 与脚本在同一目录")
+            self.ocr = None
 
     def init_session(self):
         try:
@@ -759,37 +774,36 @@ class SEULogin:
             logger.exception("获取验证码时出错")
             return None, None
 
-    def show_captcha_dialog(self, image_data):
-        root = tk.Tk()
-        root.title("验证码输入")
-        # 简化窗口大小自适应
+    def solve_captcha(self, image_data: bytes) -> str:
+        """
+        识别算术验证码并计算结果
+        例如：识别出 "2+3+9" 或 "2+3+9=?"，返回计算结果 "14"
+        """
         try:
-            image = Image.open(BytesIO(image_data))
-            image = image.resize((150, 80), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(image)
+            # 使用专用模型识别
+            raw_text = self.ocr.classification(image_data)
+            logger.info(f"OCR原始识别结果: {raw_text}")
+
+            # 清理识别结果：移除空格、等号、问号等
+            cleaned = raw_text.strip().replace(' ', '').replace('=', '').replace('?', '')
+
+            # 尝试计算算术表达式（如 2+3+9）
+            # 使用正则确保安全，只保留数字和运算符
+            if re.match(r'^[0-9+\-*/]+$', cleaned):
+                try:
+                    result = str(eval(cleaned))
+                    logger.info(f"算术计算: {cleaned} = {result}")
+                    return result
+                except Exception as e:
+                    logger.warning(f"计算表达式 '{cleaned}' 失败: {e}")
+                    return cleaned  # 如果计算失败，返回清理后的原始识别结果
+            else:
+                logger.warning(f"识别结果包含非算术字符，原样返回: {cleaned}")
+                return cleaned
+
         except Exception as e:
-            logger.error(f"加载验证码图片失败: {e}")
-            root.destroy()
-            return None
-
-        captcha_var = tk.StringVar()
-
-        tk.Label(root, image=photo).pack(pady=8)
-        tk.Label(root, text="请输入验证码:").pack()
-        entry = tk.Entry(root, textvariable=captcha_var, font=('Arial', 14), justify='center')
-        entry.pack(pady=6)
-        entry.focus_set()
-
-        def on_confirm():
-            root.quit()
-
-        tk.Button(root, text="确定", command=on_confirm, width=10).pack(pady=6)
-        root.bind('<Return>', lambda event: on_confirm())
-
-        root.mainloop()
-        value = captcha_var.get().strip()
-        root.destroy()
-        return value if value else None
+            logger.error(f"验证码识别失败: {e}")
+            return ""
 
     def login(self, username, password, captcha_value):
         login_url = f"{self.base_url}/xsxk/auth/login"
@@ -841,23 +855,56 @@ class SEULogin:
             logger.exception("登录时出错")
             return False, None
 
-    def manual_login(self, username, password):
+    def manual_login(self, username, password, max_retries=5):
+        """
+        自动登录方法：使用专用模型识别算术验证码，支持失败重试
+        """
         if not self.init_session():
             logger.error("会话初始化失败")
             return False, None
 
-        image_data, uuid = self.get_captcha()
-        if not image_data or not uuid:
-            logger.error("获取验证码失败")
+        if self.ocr is None:
+            logger.error("OCR 引擎未初始化，无法自动识别验证码")
             return False, None
 
-        captcha_value = self.show_captcha_dialog(image_data)
-        if not captcha_value:
-            logger.info("用户取消验证码输入")
-            return False, None
+        for attempt in range(max_retries):
+            image_data, uuid = self.get_captcha()
+            if not image_data or not uuid:
+                logger.error("获取验证码失败")
+                return False, None
 
-        success, result = self.login(username, password, captcha_value)
-        return success, result
+            try:
+                # 识别并计算算术验证码结果
+                captcha_value = self.solve_captcha(image_data)
+
+                if not captcha_value:
+                    logger.warning(f"第 {attempt + 1} 次尝试：验证码识别为空，准备重试...")
+                    time.sleep(0.5)
+                    continue
+
+                logger.info(f"第 {attempt + 1} 次尝试，提交验证码结果: {captcha_value}")
+
+            except Exception as e:
+                logger.error(f"OCR 识别异常: {e}")
+                time.sleep(0.5)
+                continue
+
+            success, result = self.login(username, password, captcha_value)
+            if success:
+                return True, result
+            else:
+                msg = result.get('msg', '') if result else ''
+                # 如果是验证码错误，自动重试；如果是密码错误等其他错误，直接返回
+                if '验证码' in msg or 'captcha' in msg.lower() or '错误' in msg:
+                    logger.warning(f"验证码错误（可能是识别错误），准备重试... ({attempt + 1}/{max_retries})")
+                    time.sleep(0.3)
+                    continue
+                else:
+                    # 账号密码错误等其他情况，不再重试
+                    return False, result
+
+        logger.error(f"达到最大重试次数 ({max_retries})，登录失败")
+        return False, {"msg": "验证码识别失败或达到最大重试次数"}
 
     def get_login_result(self):
         return {
@@ -873,9 +920,9 @@ class SEULogin:
 async def run_selector_after_login(config: Dict):
     # 登录
     logger.info("=" * 60)
-    logger.info("请先输入账号与密码（密码输入将隐藏）")
-    username = global_username;
-    password = global_password;
+    logger.info("使用专用模型自动识别算术验证码登录")
+    username = global_username
+    password = global_password
 
     login_client = SEULogin()
     success, _ = login_client.manual_login(username, password)
@@ -917,7 +964,6 @@ async def run_selector_after_login(config: Dict):
 
 
 def main():
-    logger.info("📝 合并版：登录 + 异步选课（双队列）")
     logger.info("=" * 60)
     logger.info(f"目标课程数（配置）: {len(CONFIG['TARGET_COURSES'])}")
     try:
